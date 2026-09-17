@@ -9,12 +9,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::info;
 
+/// Exclusive upper bound for RX slot allocation; slot 0 means unbound.
+/// Valid slots are 1-13, matching `discovery::is_valid_rx`'s definition of
+/// the same range (`rx != 0 && rx < RX_SLOT_LIMIT`), so a device outside it
+/// is a latched sensor value, not a real slot.
+const RX_SLOT_LIMIT: u8 = 14;
+
 impl WirelessController {
     pub fn bind_device(&self, mac: &[u8; 6]) -> Result<()> {
         let _binding = self.begin_binding(mac)?;
         self.check_bind_allowed(mac)?;
         let master_mac = *self.master_mac.lock();
-        let new_rx = self.get_rx_unused();
+        let new_rx = self.get_rx_unused()?;
         self.converge_bind_state(mac, &master_mac, new_rx)?;
         self.confirm_binding(mac, true);
         self.save_rf_config()
@@ -248,18 +254,25 @@ impl WirelessController {
         Ok(())
     }
 
-    /// Find an unused RX endpoint (1-14) for a new device binding.
-    fn get_rx_unused(&self) -> u8 {
+    /// Find an unused RX endpoint for a new device binding.
+    ///
+    /// Fails rather than reusing a slot: two devices sharing an RX slot both
+    /// answer to commands aimed at either one. Kept on `device_health`
+    /// (`bind_intent`/`raw_rx`), the current data source for this check, not
+    /// the `discovered_devices`/`master_mac`/`rx_type` shape the original fix
+    /// for this was written against - that shape predates this file's
+    /// device_health-based rewrite upstream.
+    fn get_rx_unused(&self) -> Result<u8> {
         let health = self.device_health.lock();
-        for rx in 1..14u8 {
+        for rx in 1..RX_SLOT_LIMIT {
             let in_use = health
                 .values()
                 .any(|h| h.bind_intent && !h.dead && h.raw_rx == rx);
             if !in_use {
-                return rx;
+                return Ok(rx);
             }
         }
-        1
+        bail!("no free RX slot: all slots on this dongle are in use")
     }
 
     pub(super) fn save_rf_config(&self) -> Result<()> {
