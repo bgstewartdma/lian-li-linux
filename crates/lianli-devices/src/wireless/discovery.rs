@@ -170,6 +170,30 @@ pub(super) fn parse_device_record(data: &[u8], list_index: u8) -> Option<Discove
         return None;
     }
 
+    // Channel 0 is not a valid RF channel, so a record reporting it is a failed
+    // or partial read rather than device state. Reject it here, at the parse
+    // boundary, so that no downstream path can act on its other fields either.
+    //
+    // channel_correction_action() already guards against channel 0, which stops
+    // the daemon re-binding in response. But merge_sightings() has no such guard
+    // and feeds every record into commit_streak(addr_cand, (channel, rx_type)).
+    // These records arrive in bursts of five to eight carrying a consistent
+    // bogus rx, which clears DEBOUNCE_SIGHTINGS (3) and commits that value into
+    // published.rx_type. Every outgoing frame then addresses the device with it.
+    //
+    // Measured on an SL-INF Flex pair: published rx drifted 1 -> 40 -> 41 -> 42
+    // -> 67 under the daemon while valid slots are 1-13, and each drift
+    // coincided with the chain's fans stopping. The same hardware driven by
+    // L-Connect3 held rx=41 across 12,344 consecutive records with no dropouts.
+    if channel == 0 {
+        debug!(
+            "  Device record {list_index}: channel 0 ({:02x?}, rx={rx_type}) - \
+             failed or partial read, ignoring",
+            mac
+        );
+        return None;
+    }
+
     let mut master_mac = [0u8; 6];
     master_mac.copy_from_slice(&data[6..12]);
     // fan_num >= 10 flags SL-INF right-attach (chains right-to-left).
@@ -934,10 +958,9 @@ mod tests {
     fn parse_rejects_only_zero_mac() {
         let mut buf = [0u8; 42];
         buf[41] = 0x1C;
+        buf[12] = 8; // a valid channel throughout; channel 0 is rejected separately
         assert!(parse_device_record(&buf, 0).is_none());
         buf[0..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
-        assert!(parse_device_record(&buf, 0).is_some());
-        buf[12] = 8;
         assert!(parse_device_record(&buf, 0).is_some());
         buf[13] = 15;
         assert!(parse_device_record(&buf, 0).is_some());
@@ -996,6 +1019,7 @@ mod tests {
         assert_eq!(rec.channel, 8);
         assert_eq!(rec.rx_type, 41);
     }
+
     #[test]
     fn parse_master_record_validates() {
         let mut buf = [0u8; 42];
