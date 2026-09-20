@@ -695,7 +695,11 @@ impl WirelessController {
         h.observed_master = h.raw_master;
         h.published.bind_intent = intent;
         h.published.master_mac = h.raw_master;
-        h.published.rx_type = h.raw_rx;
+        // Same guard as the debounced path in discovery: never adopt a slot
+        // outside the allocatable range (see discovery::is_valid_rx).
+        if super::discovery::is_valid_rx(h.raw_rx) {
+            h.published.rx_type = h.raw_rx;
+        }
         h.published.channel = h.raw_channel;
         if let Some(device) = self
             .discovered_devices

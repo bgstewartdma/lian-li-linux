@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// A wireless device discovered via the RX GetDev command.
 /// Parsed from the 42-byte device record in the response.
@@ -246,6 +246,31 @@ pub(super) fn parse_device_record(data: &[u8], list_index: u8) -> Option<Discove
 
 pub(super) const LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 const DEBOUNCE_SIGHTINGS: u32 = 3;
+
+/// Exclusive upper bound for RX slots. `get_rx_unused()` allocates from 1..14,
+/// so anything at or above this was never a slot this daemon handed out.
+pub(super) const RX_SLOT_LIMIT: u8 = 14;
+
+/// Whether an RX slot reported by a device is one we could legitimately use.
+///
+/// The master-clock broadcast (`RF_SELECT` / `RF_CLOCK_SYNC`) writes its sensor
+/// payload starting at `rf_data[14]`, which is the same byte offset that
+/// targeted frames use for `rx_type`, and `build_payload()` puts `cpu_temp` at
+/// `payload[0]`. Devices come back reporting that value as their slot, so the
+/// observed `rx` tracks CPU temperature: values of 40-71 were seen on this
+/// hardware while `k10temp` read 41-71, and a chain adopted `rx=41` after
+/// twelve seconds of broadcasts carrying 41. Two chains receiving the same
+/// broadcast adopt the same slot and then both answer commands aimed at either.
+///
+/// L-Connect3 transmits the identical frame layout but with `rf_data[14] = 0`
+/// when it has no CPU temperature to report, and 0 is already rejected
+/// elsewhere - which is why the drift is not seen under it.
+///
+/// Whatever the device-side semantics, a slot outside the allocatable range is
+/// never a value this daemon should address a device with.
+pub(super) fn is_valid_rx(rx: u8) -> bool {
+    rx != 0 && rx < RX_SLOT_LIMIT
+}
 pub(super) const ACK_FRESHNESS: Duration = Duration::from_secs(3);
 pub(super) const REBIND_FOREIGN_AFTER: Duration = Duration::from_secs(10);
 
@@ -648,7 +673,21 @@ fn merge_sightings(
 
         if let Some((ch, rx)) = commit_streak(&mut h.addr_cand, (rec.channel, rec.rx_type)) {
             h.published.channel = ch;
-            h.published.rx_type = rx;
+            // Only adopt a slot we could have allocated. See is_valid_rx: the
+            // master-clock broadcast leaks cpu_temp into this field, so devices
+            // report slots in the 40-71 range that no allocation produced.
+            // Keeping the previous slot is always better than addressing the
+            // device somewhere it was never bound.
+            if is_valid_rx(rx) {
+                h.published.rx_type = rx;
+            } else {
+                warn!(
+                    "{} reported out-of-range rx={rx} (valid 1-{}); keeping rx={}",
+                    rec.mac_str(),
+                    RX_SLOT_LIMIT - 1,
+                    h.published.rx_type
+                );
+            }
         }
 
         if !h.bind_intent && !h.man_unbind && rec.master_mac == local {
@@ -906,6 +945,57 @@ mod tests {
         assert!(parse_device_record(&buf, 0).is_some());
     }
 
+    /// An RX slot outside the allocatable range must never be adopted.
+    ///
+    /// The master-clock broadcast writes `cpu_temp` into `rf_data[14]`, the
+    /// byte targeted frames use for `rx_type`, so devices report slots that
+    /// track CPU temperature. Adopting one addresses the device where it was
+    /// never bound, and two chains on the same broadcast collide on the same
+    /// slot.
+    #[test]
+    fn out_of_range_rx_is_not_adopted() {
+        assert!(is_valid_rx(1));
+        assert!(is_valid_rx(13));
+        assert!(!is_valid_rx(0));
+        assert!(!is_valid_rx(RX_SLOT_LIMIT));
+        // The values actually observed on hardware, all CPU temperatures.
+        for observed in [40u8, 41, 42, 44, 49, 61, 62, 64, 67, 71] {
+            assert!(!is_valid_rx(observed), "rx={observed} must be rejected");
+        }
+    }
+
+    /// A failed or partial read surfaces as channel 0. It must be rejected at
+    /// the parse boundary, not merely excluded from channel correction.
+    ///
+    /// merge_sightings() feeds every parsed record into
+    /// commit_streak(addr_cand, (channel, rx_type)). These records arrive in
+    /// bursts well over DEBOUNCE_SIGHTINGS carrying a consistent bogus rx, so
+    /// without this the burst commits that rx into published.rx_type and every
+    /// subsequent frame addresses the device with it.
+    #[test]
+    fn parse_rejects_channel_zero() {
+        let mut buf = [0u8; 42];
+        buf[41] = 0x1C;
+        buf[0..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+
+        // Channel 0 with an otherwise plausible record, including the
+        // out-of-range rx values observed in the wild (valid slots are 1-13).
+        for bogus_rx in [0u8, 1, 41, 67] {
+            buf[12] = 0;
+            buf[13] = bogus_rx;
+            assert!(
+                parse_device_record(&buf, 0).is_none(),
+                "channel 0 with rx={bogus_rx} must be rejected"
+            );
+        }
+
+        // The same record on a valid channel is accepted.
+        buf[12] = 8;
+        buf[13] = 41;
+        let rec = parse_device_record(&buf, 0).expect("valid channel must parse");
+        assert_eq!(rec.channel, 8);
+        assert_eq!(rec.rx_type, 41);
+    }
     #[test]
     fn parse_master_record_validates() {
         let mut buf = [0u8; 42];
