@@ -236,6 +236,10 @@ impl RgbController {
         presets: &[RgbPreset],
     ) -> anyhow::Result<RenderState> {
         let old = self.render_state(&device.device_id)?;
+        // Whether anything has already been rendered for this device in this
+        // process. Distinguishes "fresh start, apply the config" from "a live
+        // frame is on screen, leave it alone".
+        let has_live_frame = self.rendered.contains_key(&device.device_id);
         let preset = device.active_preset.as_ref().and_then(|name| {
             presets
                 .iter()
@@ -288,6 +292,24 @@ impl RgbController {
                     });
                     if let Some(colors) = colors {
                         next.set_direct(zone.zone_index, &colors.colors)?;
+                    } else if !zone.effect.colors.is_empty() && !has_live_frame {
+                        // No live frame exists yet - this is a fresh start - so
+                        // honour the colours stored against the zone. Without
+                        // this, Direct always falls through to the previously
+                        // rendered frame, which is all zeros after a restart, so
+                        // a configured per-LED pattern renders black and can
+                        // never survive a reboot.
+                        //
+                        // Gated on `has_live_frame` so that an unrelated config
+                        // save does not clobber a frame pushed via
+                        // SetRgbDirect/SetRgbFrames, which is what the
+                        // `unrelated_saves_preserve_live_frames_and_direct_colors`
+                        // test guards.
+                        let span = old.range(zone.zone_index)?.len();
+                        let src = &zone.effect.colors;
+                        let filled: Vec<[u8; 3]> =
+                            (0..span).map(|i| src[i % src.len()]).collect();
+                        next.set_direct(zone.zone_index, &filled)?;
                     } else {
                         next.set_direct(zone.zone_index, &old.colors[old.range(zone.zone_index)?])?;
                     }
@@ -439,6 +461,45 @@ mod tests {
             vec![effects[0].effect.clone()]
         );
         controller.stop();
+    }
+
+    /// A Direct zone with colours in config must render those colours on a
+    /// fresh start, so a configured per-LED pattern survives a daemon restart.
+    ///
+    /// Before this, Direct always fell through to the previously rendered
+    /// frame, which is all zeros on a fresh start - so the LEDs went black and
+    /// the stored colours were never used.
+    #[test]
+    fn direct_zone_uses_configured_colors_on_fresh_start() {
+        let (sender, received) = mpsc::channel();
+        let device = Arc::new(LoopDevice(sender)) as Arc<dyn RgbDevice>;
+        let mut controller =
+            RgbController::new(HashMap::from([("live".into(), device)]), None);
+
+        let mut saved = saved_device("live");
+        saved.zones = vec![RgbZoneConfig {
+            zone_index: 0,
+            effect: RgbEffect {
+                mode: RgbMode::Direct,
+                colors: vec![[9, 8, 7]],
+                ..Default::default()
+            },
+            swap_lr: false,
+            swap_tb: false,
+        }];
+        let config = RgbAppConfig {
+            enabled: true,
+            devices: vec![saved],
+            ..Default::default()
+        };
+
+        controller.apply_config(&config, &[]);
+        let sent = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            sent,
+            vec![vec![[9, 8, 7]]],
+            "a fresh start must render the configured Direct colours, not black"
+        );
     }
 
     #[test]
