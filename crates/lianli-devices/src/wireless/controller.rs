@@ -832,6 +832,24 @@ impl WirelessController {
         device: &DiscoveredDevice,
         rf_data: &[u8],
     ) -> Result<()> {
+        self.send_rf_packet_addressed(handle, device.channel, device.rx_type, rf_data)
+    }
+
+    /// Send an RF frame with an explicit RX target in the USB header.
+    ///
+    /// `rx_target` is the slot the dongle addresses the frame to; `0xFF`
+    /// broadcasts to every device, leaving the destination MAC inside the frame
+    /// to select the recipient. Recovery paths need this: a device that latched
+    /// an out-of-range slot is not listening on the slot we have published for
+    /// it, and the guard that withholds a slot publishes `0` - so a frame
+    /// addressed from the published value reaches nothing at all.
+    pub(super) fn send_rf_packet_addressed(
+        &self,
+        handle: &RusbBulk,
+        channel: u8,
+        rx_target: u8,
+        rf_data: &[u8],
+    ) -> Result<()> {
         anyhow::ensure!(
             rf_data.len() == RF_DATA_SIZE,
             "invalid RGB RF packet length"
@@ -840,8 +858,8 @@ impl WirelessController {
             let mut packet = [0u8; 64];
             packet[0] = USB_CMD_SEND_RF;
             packet[1] = chunk_idx;
-            packet[2] = device.channel;
-            packet[3] = device.rx_type;
+            packet[2] = channel;
+            packet[3] = rx_target;
 
             let start = chunk_idx as usize * RF_CHUNK_SIZE;
             let end = start + RF_CHUNK_SIZE;

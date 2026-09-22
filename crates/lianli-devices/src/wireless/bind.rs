@@ -201,11 +201,14 @@ impl WirelessController {
             .context("device not found in discovery")?;
 
         let master_ch = *self.master_channel.lock();
-        let slot = if target_rx == 0 {
-            0
-        } else {
-            self.next_slot_index(&device)
-        };
+        // Byte 16 is the RX slot the device re-binds itself from, so it must
+        // carry the slot we are actually assigning - the same value as byte 14.
+        // Deriving it from the device's position in the discovery list made the
+        // two disagree (observed: "rx=1 ... slot=2"), and converge_bind_state
+        // waits for the device to report `target_rx`, so a bind whose byte 16
+        // says something else can never converge and retries until it times
+        // out. Unbind passes target_rx = 0, which zeroes both fields as before.
+        let slot = target_rx;
 
         let mut rf_data = vec![0u8; RF_DATA_SIZE];
         rf_data[0] = RF_SELECT;
@@ -219,7 +222,14 @@ impl WirelessController {
 
         self.tx_recover(|handle| {
             for _ in 0..6 {
-                self.send_rf_packet(handle, &device, &rf_data)?;
+                // Broadcast rather than addressing the device at its published
+                // slot. Binding is the operation that recovers a device which
+                // has drifted onto a slot we do not know, or whose slot the
+                // discovery guard withheld (published 0) precisely because it
+                // was out of range - in both cases a unicast frame built from
+                // the published slot is delivered nowhere. The destination MAC
+                // in the frame still selects the device.
+                self.send_rf_packet_addressed(handle, device.channel, 0xFF, &rf_data)?;
                 thread::sleep(Duration::from_millis(30));
             }
             Ok(())
