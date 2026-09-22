@@ -500,7 +500,23 @@ impl ServiceManager {
         let configured = self.configured_wireless_device_ids();
         let now = Instant::now();
 
-        let Some(mac) = self.wireless.rebind_candidates().into_iter().find(|m| {
+        // rebind_candidates() covers a device we had already bound this
+        // session that reverted to reporting no master - it requires
+        // bind_intent, which is exactly what a device never claims if it
+        // arrives (or falls all the way back to) masterless in the first
+        // place. unbound_devices() has no such precondition and already
+        // includes that case; it just had no automatic caller. A masterless
+        // configured device - `3a:a9` observed reporting master
+        // `000000000000` on 2026-09-22 - previously required a manual
+        // BindWirelessDevice forever, identical in kind to the slot-recovery
+        // gap `rebind_slotless_devices()` closes for a bad-but-bound rx.
+        let mut candidates = self
+            .wireless
+            .rebind_candidates()
+            .into_iter()
+            .chain(self.wireless.unbound_devices().into_iter().map(|d| d.mac));
+
+        let Some(mac) = candidates.find(|m| {
             let id = format!(
                 "wireless:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 m[0], m[1], m[2], m[3], m[4], m[5]
