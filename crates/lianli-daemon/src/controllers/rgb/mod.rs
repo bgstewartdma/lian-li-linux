@@ -59,6 +59,12 @@ pub struct RgbController {
     thermal_last_color: Option<[u8; 3]>,
     last_direct: HashMap<(String, u8), Vec<[u8; 3]>>,
     mb_sync_state: HashMap<String, bool>,
+    /// Direct-mode zone colours last rendered *because config asked for
+    /// them*, as opposed to a live SetRgbDirect/SetRgbFrames push. Lets
+    /// configured_render() tell an intentional colour change in config
+    /// apart from an unrelated config save that must not clobber a live
+    /// frame - both look identical as "a live frame exists" otherwise.
+    configured_direct_colors: HashMap<(String, u8), Vec<[u8; 3]>>,
 }
 
 impl RgbController {
@@ -87,6 +93,7 @@ impl RgbController {
             thermal_last_color: None,
             last_direct: HashMap::new(),
             mb_sync_state: HashMap::new(),
+            configured_direct_colors: HashMap::new(),
         };
         controller.refresh_wireless_devices();
         controller
@@ -310,6 +317,9 @@ impl RgbController {
         self.last_direct.retain(|(id, _), _| {
             self.wired.contains_key(id) || self.wireless_state.contains_key(id)
         });
+        self.configured_direct_colors.retain(|(id, _), _| {
+            self.wired.contains_key(id) || self.wireless_state.contains_key(id)
+        });
     }
 
     pub fn retain_wired(&mut self, present: &std::collections::HashSet<String>) {
@@ -332,6 +342,8 @@ impl RgbController {
                 self.rendered.remove(&id);
                 self.mb_sync_state.remove(&id);
                 self.last_direct.retain(|(device, _), _| device != &id);
+                self.configured_direct_colors
+                    .retain(|(device, _), _| device != &id);
             }
         }
     }
@@ -374,6 +386,9 @@ impl RgbController {
         self.uploads
             .retain(|id, _| self.wireless_state.contains_key(id));
         self.last_direct.retain(|(id, _), _| {
+            self.wired.contains_key(id) || self.wireless_state.contains_key(id)
+        });
+        self.configured_direct_colors.retain(|(id, _), _| {
             self.wired.contains_key(id) || self.wireless_state.contains_key(id)
         });
     }
