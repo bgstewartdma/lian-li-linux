@@ -250,6 +250,7 @@ pub struct ServiceManager {
     wireless_stable_count: usize,
     wireless_pending_count: Option<usize>,
     wireless_pending_streak: u32,
+    wireless_topology_mismatch_streak: u32,
     wireless_rebind_in_flight: Arc<AtomicBool>,
     wireless_rebind_last: HashMap<[u8; 6], Instant>,
     wireless_channel_streak: Option<(u8, u32)>,
@@ -320,6 +321,7 @@ impl ServiceManager {
             wireless_stable_count: 0,
             wireless_pending_count: None,
             wireless_pending_streak: 0,
+            wireless_topology_mismatch_streak: 0,
             wireless_rebind_in_flight: Arc::new(AtomicBool::new(false)),
             wireless_rebind_last: HashMap::new(),
             wireless_channel_streak: None,
@@ -459,7 +461,17 @@ impl ServiceManager {
             .as_ref()
             .is_some_and(|rgb| !rgb.lock().wireless_topology_matches(&wireless_devices))
         {
-            self.rebuild_rgb_controller();
+            // A single glitched discovery read must not immediately tear
+            // down and repaint RGB state - require the mismatch to persist
+            // for 3 consecutive polls, mirroring the debounce already used
+            // for device-count changes above.
+            self.wireless_topology_mismatch_streak += 1;
+            if self.wireless_topology_mismatch_streak >= 3 {
+                self.rebuild_rgb_controller();
+                self.wireless_topology_mismatch_streak = 0;
+            }
+        } else {
+            self.wireless_topology_mismatch_streak = 0;
         }
 
         self.run_wireless_rebind_supervisor();
