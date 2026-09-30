@@ -21,7 +21,7 @@ impl RgbController {
         Ok(())
     }
 
-    pub fn validate_config(&mut self, config: &RgbAppConfig) -> anyhow::Result<()> {
+    pub fn validate_config(&self, config: &RgbAppConfig) -> anyhow::Result<()> {
         lianli_shared::rgb::validate_effect_memory(config).map_err(anyhow::Error::msg)?;
         self.validate_fan_led_counts(config)?;
         if !config.enabled || config.openrgb_server {
@@ -36,9 +36,10 @@ impl RgbController {
             if device.mb_rgb_sync || !self.software_controlled(&device.device_id) {
                 continue;
             }
-            // record=false: this is a dry run to surface errors before saving,
-            // it must not persist state that the real apply relies on.
-            let state = self.configured_render(device, &presets, false)?;
+            // This is a dry run to surface errors before saving; the direct-
+            // colour updates configured_render() returns are discarded, not
+            // applied, since nothing here actually reaches the device.
+            let (state, _) = self.configured_render(device, &presets)?;
             if let Some(profile) = self.regional_profile(&device.device_id) {
                 if let Some(regions) = &state.regions {
                     let animation = lianli_media::rgb::family::render(profile, regions)?;
@@ -166,8 +167,23 @@ impl RgbController {
                 if mb_rgb_sync {
                     self.set_mb_rgb_sync(&device.device_id, true)?;
                 } else if self.software_controlled(&device.device_id) {
-                    let next = self.configured_render(device, presets, true)?;
+                    let (next, direct_color_updates) = self.configured_render(device, presets)?;
                     self.apply_render(&device.device_id, next)?;
+                    // Only commit once apply_render has actually succeeded -
+                    // recording these unconditionally would mark a colour as
+                    // "already configured" even when the write to the device
+                    // failed, so a retry of the same config would never
+                    // re-attempt it.
+                    for (key, value) in direct_color_updates {
+                        match value {
+                            Some(colors) => {
+                                self.configured_direct_colors.insert(key, colors);
+                            }
+                            None => {
+                                self.configured_direct_colors.remove(&key);
+                            }
+                        }
+                    }
                 } else if let Some(effects) = self.configured_group_effects(device, presets)? {
                     self.set_mb_rgb_sync(&device.device_id, false)?;
                     self.wired[&device.device_id].set_group_effects(&effects)?;
@@ -233,12 +249,22 @@ impl RgbController {
         wired.resolve_group_config(&effective)
     }
 
+    /// Renders `device`'s configured state without mutating `self`.
+    ///
+    /// Alongside the frame, returns the `configured_direct_colors` updates
+    /// this render implies: `Some(colours)` for a zone whose config now
+    /// specifies Direct colours, `None` to clear a zone that no longer does
+    /// (preset override, or colours emptied) so a later save of the same
+    /// colours is not mistaken for "unchanged" against a stale entry. The
+    /// caller applies these only once the render has actually been accepted
+    /// by the device - applying them unconditionally here would record a
+    /// colour as "already configured" even when `apply_render` goes on to
+    /// fail, poisoning the comparison for every retry after.
     fn configured_render(
-        &mut self,
+        &self,
         device: &lianli_shared::rgb::RgbDeviceConfig,
         presets: &[RgbPreset],
-        record: bool,
-    ) -> anyhow::Result<RenderState> {
+    ) -> anyhow::Result<(RenderState, Vec<((String, u8), Option<Vec<[u8; 3]>>)>)> {
         let old = self.render_state(&device.device_id)?;
         // Whether anything has already been rendered for this device in this
         // process. Distinguishes "fresh start, apply the config" from "a live
@@ -285,9 +311,11 @@ impl RgbController {
                 "device does not support regional RGB effects"
             );
         }
+        let mut direct_color_updates = Vec::new();
         if next.regions.is_none() {
             for zone in &effective.zones {
                 if zone.effect.mode == RgbMode::Direct {
+                    let key = (device.device_id.clone(), zone.zone_index);
                     let colors = preset.and_then(|preset| {
                         preset
                             .zones
@@ -295,6 +323,11 @@ impl RgbController {
                             .find(|entry| entry.zone == zone.zone_index && !entry.colors.is_empty())
                     });
                     if let Some(colors) = colors {
+                        // A preset now drives this zone, so any previously
+                        // tracked config colours are no longer current -
+                        // clear them rather than leave a stale entry that a
+                        // later config save could wrongly match against.
+                        direct_color_updates.push((key, None));
                         next.set_direct(zone.zone_index, &colors.colors)?;
                     } else if !zone.effect.colors.is_empty() {
                         // Distinguish "config itself just asked for a different
@@ -305,13 +338,9 @@ impl RgbController {
                         // a Direct zone's colour once the device had rendered
                         // once: it always fell through to the previously
                         // rendered frame instead of the newly saved one.
-                        let key = (device.device_id.clone(), zone.zone_index);
                         let changed =
                             self.configured_direct_colors.get(&key) != Some(&zone.effect.colors);
-                        if record {
-                            self.configured_direct_colors
-                                .insert(key, zone.effect.colors.clone());
-                        }
+                        direct_color_updates.push((key, Some(zone.effect.colors.clone())));
                         if changed || !has_live_frame {
                             // Either the config just changed this zone's
                             // colours, or no live frame exists yet (a fresh
@@ -332,6 +361,10 @@ impl RgbController {
                             )?;
                         }
                     } else {
+                        // No colours configured for this zone at all -
+                        // likewise not a current config-driven colour, so
+                        // clear any stale entry.
+                        direct_color_updates.push((key, None));
                         next.set_direct(zone.zone_index, &old.colors[old.range(zone.zone_index)?])?;
                     }
                 } else {
@@ -339,7 +372,7 @@ impl RgbController {
                 }
             }
         }
-        Ok(next)
+        Ok((next, direct_color_updates))
     }
 }
 
@@ -570,6 +603,65 @@ mod tests {
         controller.stop();
     }
 
+    /// Clearing a zone's configured colours must drop any stale tracking for
+    /// it, so a later save that happens to restore the same colour values is
+    /// still recognised as a real change rather than matching leftover state
+    /// from before the colours were cleared.
+    #[test]
+    fn direct_zone_clears_stale_tracking_when_colours_are_emptied() {
+        let (sender, received) = mpsc::channel();
+        let device = Arc::new(LoopDevice(sender)) as Arc<dyn RgbDevice>;
+        let mut controller = RgbController::new(HashMap::from([("live".into(), device)]), None);
+
+        let mut saved = saved_device("live");
+        saved.zones = vec![RgbZoneConfig {
+            zone_index: 0,
+            effect: RgbEffect {
+                mode: RgbMode::Direct,
+                colors: vec![[9, 8, 7]],
+                ..Default::default()
+            },
+            swap_lr: false,
+            swap_tb: false,
+        }];
+        let mut config = RgbAppConfig {
+            enabled: true,
+            devices: vec![saved],
+            ..Default::default()
+        };
+
+        controller.apply_config(&config, &[]);
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            vec![vec![[9, 8, 7]]]
+        );
+
+        // Clear the zone's configured colours, as switching away from a
+        // custom pattern would.
+        config.devices[0].zones[0].effect.colors = vec![];
+        controller.apply_config(&config, &[]);
+
+        // Push an unrelated live frame directly.
+        controller.set_direct_colors("live", 0, &[[1, 2, 3]]).unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            vec![vec![[1, 2, 3]]]
+        );
+
+        // Restore the original configured colour. Before this fix, the
+        // stale tracking entry from the very first apply still said
+        // [9,8,7] was already configured, so this would be wrongly treated
+        // as unchanged and the live frame would be left in place instead.
+        config.devices[0].zones[0].effect.colors = vec![[9, 8, 7]];
+        controller.apply_config(&config, &[]);
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            vec![vec![[9, 8, 7]]],
+            "restoring a colour after it was cleared must repaint, not match stale tracking"
+        );
+        controller.stop();
+    }
+
     #[test]
     fn unrelated_saves_preserve_live_frames_and_direct_colors() {
         for direct in [false, true] {
@@ -744,7 +836,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let state = controller.configured_render(&config, &[], true).unwrap();
+        let (state, _) = controller.configured_render(&config, &[]).unwrap();
         assert_eq!(state.counts, [26; 3]);
         assert_eq!(state.colors.len(), 78);
         assert!(state.regions.is_none());
