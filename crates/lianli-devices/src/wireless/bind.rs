@@ -262,12 +262,21 @@ impl WirelessController {
     /// the `discovered_devices`/`master_mac`/`rx_type` shape the original fix
     /// for this was written against - that shape predates this file's
     /// device_health-based rewrite upstream.
+    ///
+    /// Checks both `raw_rx` and `published.rx_type`, not `raw_rx` alone. A
+    /// device can have a valid `published.rx_type` that every outgoing frame
+    /// still addresses it at, while its `raw_rx` has drifted to an
+    /// out-of-range value the discovery guard correctly withheld from ever
+    /// reaching `published`. Checking only `raw_rx` would see that device's
+    /// real, still-live slot as free and hand it to a new device, recreating
+    /// the exact two-devices-one-slot collision this function exists to
+    /// prevent.
     fn get_rx_unused(&self) -> Result<u8> {
         let health = self.device_health.lock();
         for rx in 1..RX_SLOT_LIMIT {
-            let in_use = health
-                .values()
-                .any(|h| h.bind_intent && !h.dead && h.raw_rx == rx);
+            let in_use = health.values().any(|h| {
+                h.bind_intent && !h.dead && (h.raw_rx == rx || h.published.rx_type == rx)
+            });
             if !in_use {
                 return Ok(rx);
             }
@@ -375,6 +384,23 @@ mod tests {
         drop(binding);
         assert!(c.bind_device(&mac).is_err());
         assert!(c.binding_mac.lock().is_none());
+    }
+
+    #[test]
+    fn get_rx_unused_skips_a_slot_still_live_via_published_rx_type() {
+        let c = controller_with([9u8; 6], false);
+        seed_device(&c, &[1, 2, 3, 4, 5, 6], [9u8; 6], true);
+        // seed_device leaves raw_rx at DeviceHealth::new's default (0) while
+        // published.rx_type is 1 - the shape of a device whose raw report
+        // has drifted to an out-of-range value the discovery guard withheld
+        // from published, while every outgoing frame still addresses it at
+        // its real, live slot, 1. Checking raw_rx alone would see slot 1 as
+        // free and hand it to a new device.
+        assert_eq!(
+            c.get_rx_unused().unwrap(),
+            2,
+            "slot 1 is still live via published.rx_type even though raw_rx disagrees"
+        );
     }
 
     #[test]
