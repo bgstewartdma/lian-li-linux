@@ -59,11 +59,7 @@ pub struct RgbController {
     thermal_last_color: Option<[u8; 3]>,
     last_direct: HashMap<(String, u8), Vec<[u8; 3]>>,
     mb_sync_state: HashMap<String, bool>,
-    /// Direct-mode zone colours last rendered *because config asked for
-    /// them*, as opposed to a live SetRgbDirect/SetRgbFrames push. Lets
-    /// configured_render() tell an intentional colour change in config
-    /// apart from an unrelated config save that must not clobber a live
-    /// frame - both look identical as "a live frame exists" otherwise.
+    // Unrelated config saves must preserve colours pushed by live RGB clients.
     configured_direct_colors: HashMap<(String, u8), Vec<[u8; 3]>>,
 }
 

@@ -675,23 +675,27 @@ impl WirelessController {
             .collect()
     }
 
-    /// Recovery requires ownership confirmed in this runtime and sustained loss of that ownership.
+    /// The caller must restrict recovery to configured devices.
     pub fn rebind_candidates(&self) -> Vec<[u8; 6]> {
+        let local = *self.master_mac.lock();
+        if local == [0; 6] {
+            return Vec::new();
+        }
         self.device_health
             .lock()
             .iter()
             .filter(|(_, h)| {
-                if h.dead
-                    || h.man_unbind
-                    || !h.bind_intent
-                    || h.observed_master != [0u8; 6]
-                    || h.raw_master != [0u8; 6]
-                    || h.raw_seen.elapsed() > ACK_FRESHNESS
-                {
+                if h.dead || h.man_unbind || h.raw_seen.elapsed() > ACK_FRESHNESS {
                     return false;
                 }
-                h.foreign_since
-                    .is_some_and(|t| t.elapsed() >= REBIND_FOREIGN_AFTER)
+                if h.observed_master == local && h.raw_master == local {
+                    return h.bind_intent && h.confirmed_invalid_rx == Some(h.raw_rx);
+                }
+                h.observed_master == [0; 6]
+                    && h.raw_master == [0; 6]
+                    && (!h.bind_intent
+                        || h.foreign_since
+                            .is_some_and(|t| t.elapsed() >= REBIND_FOREIGN_AFTER))
             })
             .map(|(mac, _)| *mac)
             .collect()
@@ -706,11 +710,10 @@ impl WirelessController {
         h.observed_master = h.raw_master;
         h.published.bind_intent = intent;
         h.published.master_mac = h.raw_master;
-        // Same guard as the debounced path in discovery: never adopt a slot
-        // outside the allocatable range (see discovery::is_valid_rx).
-        if super::discovery::is_valid_rx(h.raw_rx) {
+        if !intent || super::discovery::is_valid_rx(h.raw_rx) {
             h.published.rx_type = h.raw_rx;
         }
+        h.confirmed_invalid_rx = None;
         h.published.channel = h.raw_channel;
         if let Some(device) = self
             .discovered_devices
@@ -1304,6 +1307,32 @@ mod tests {
     }
 
     #[test]
+    fn invalid_rx_recovery_rejects_stale_foreign_dead_and_manually_unbound_devices() {
+        let mut healthy = entry([9; 6]);
+        healthy.bind_intent = true;
+        healthy.raw_rx = 41;
+        healthy.confirmed_invalid_rx = Some(41);
+        let c = controller_with_health(vec![(mac(), healthy)]);
+        assert_eq!(c.rebind_candidates(), vec![mac()]);
+        for blocked in 0..5 {
+            {
+                let mut health = c.device_health.lock();
+                let h = health.get_mut(&mac()).unwrap();
+                h.man_unbind = blocked == 0;
+                h.dead = blocked == 1;
+                h.raw_master = if blocked == 2 { [7; 6] } else { [9; 6] };
+                h.observed_master = if blocked == 3 { [7; 6] } else { [9; 6] };
+                h.raw_seen = if blocked == 4 {
+                    Instant::now() - ACK_FRESHNESS - Duration::from_secs(1)
+                } else {
+                    Instant::now()
+                };
+            }
+            assert!(c.rebind_candidates().is_empty(), "blocked case {blocked}");
+        }
+    }
+
+    #[test]
     fn masterless_intent_needs_timer() {
         let mut h = entry([0u8; 6]);
         h.bind_intent = true;
@@ -1323,15 +1352,15 @@ mod tests {
     }
 
     #[test]
-    fn masterless_at_startup_is_not_automatically_claimed() {
+    fn masterless_at_startup_is_available_for_configured_recovery() {
         let c = controller_with_health(vec![(mac(), entry([0u8; 6]))]);
-        assert!(c.rebind_candidates().is_empty());
+        assert_eq!(c.rebind_candidates(), vec![mac()]);
         c.device_health
             .lock()
             .get_mut(&mac())
             .unwrap()
             .foreign_since = Some(Instant::now() - REBIND_FOREIGN_AFTER - Duration::from_secs(1));
-        assert!(c.rebind_candidates().is_empty());
+        assert_eq!(c.rebind_candidates(), vec![mac()]);
     }
 
     #[test]

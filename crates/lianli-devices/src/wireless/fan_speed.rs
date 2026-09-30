@@ -44,6 +44,7 @@ impl WirelessController {
             ))?;
 
         drop(devices);
+        let slot_index = self.next_slot_index(&device);
 
         let pwm = prepare_pwm(fan_pwm, &device)?;
 
@@ -62,7 +63,7 @@ impl WirelessController {
             return Ok(());
         }
 
-        let rf_data = build_pwm_packet(&device, &master_mac, master_ch, pwm);
+        let rf_data = build_pwm_packet(&device, &master_mac, master_ch, slot_index, pwm);
 
         self.enqueue_rf_command(&device, rf_data, AckSignal::Pwm(pwm), "fan PWM")?;
 
@@ -137,6 +138,7 @@ fn build_pwm_packet(
     device: &DiscoveredDevice,
     master_mac: &[u8; 6],
     channel: u8,
+    slot: u8,
     pwm: [u8; 4],
 ) -> Vec<u8> {
     let mut data = vec![0; RF_DATA_SIZE];
@@ -146,13 +148,8 @@ fn build_pwm_packet(
     data[8..14].copy_from_slice(master_mac);
     data[14] = device.rx_type;
     data[15] = channel;
-    // Bind and fan-speed frames share RF_PWM_CMD, and the device re-binds
-    // itself from byte 16. It must therefore carry the device's actual RX
-    // slot, the same value as byte 14. Deriving it from the device's position
-    // in the discovery list re-binds devices onto transient list indices: any
-    // window where one device is not yet seen as bound shifts another into its
-    // place and collapses multiple chains onto the same slot.
-    data[16] = device.rx_type;
+    // The vendor's sensor-group index is separate from the RF address.
+    data[16] = slot;
     data[17..21].copy_from_slice(&pwm);
     data
 }
@@ -194,15 +191,11 @@ mod tests {
         for family in [WirelessFanType::Slv3Led, WirelessFanType::Slv3Lcd] {
             let device = device(family);
             let pwm = prepare_pwm(None, &device).unwrap();
-            let packet = build_pwm_packet(&device, &[9; 6], 8, pwm);
+            let packet = build_pwm_packet(&device, &[9; 6], 8, 3, pwm);
             assert_eq!(
                 &packet[..21],
-                &[0x12, 0x10, 1, 2, 3, 4, 5, 6, 9, 9, 9, 9, 9, 9, 2, 8, 2, 6, 6, 6, 6]
+                &[0x12, 0x10, 1, 2, 3, 4, 5, 6, 9, 9, 9, 9, 9, 9, 2, 8, 3, 6, 6, 6, 6]
             );
-            // The device re-binds itself from byte 16, so it must always equal
-            // byte 14 (its RX slot) and never a discovery-list position.
-            assert_eq!(packet[16], packet[14]);
-            assert_eq!(packet[16], device.rx_type);
             assert_eq!(packet.len(), 240);
             assert!(packet[21..].iter().all(|&byte| byte == 0));
             assert_eq!(

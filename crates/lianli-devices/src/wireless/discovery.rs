@@ -275,23 +275,6 @@ const DEBOUNCE_SIGHTINGS: u32 = 3;
 /// so anything at or above this was never a slot this daemon handed out.
 pub(super) const RX_SLOT_LIMIT: u8 = 14;
 
-/// Whether an RX slot reported by a device is one we could legitimately use.
-///
-/// The master-clock broadcast (`RF_SELECT` / `RF_CLOCK_SYNC`) writes its sensor
-/// payload starting at `rf_data[14]`, which is the same byte offset that
-/// targeted frames use for `rx_type`, and `build_payload()` puts `cpu_temp` at
-/// `payload[0]`. Devices come back reporting that value as their slot, so the
-/// observed `rx` tracks CPU temperature: values of 40-71 were seen on this
-/// hardware while `k10temp` read 41-71, and a chain adopted `rx=41` after
-/// twelve seconds of broadcasts carrying 41. Two chains receiving the same
-/// broadcast adopt the same slot and then both answer commands aimed at either.
-///
-/// L-Connect3 transmits the identical frame layout but with `rf_data[14] = 0`
-/// when it has no CPU temperature to report, and 0 is already rejected
-/// elsewhere - which is why the drift is not seen under it.
-///
-/// Whatever the device-side semantics, a slot outside the allocatable range is
-/// never a value this daemon should address a device with.
 pub(super) fn is_valid_rx(rx: u8) -> bool {
     rx != 0 && rx < RX_SLOT_LIMIT
 }
@@ -382,6 +365,7 @@ pub(super) struct DeviceHealth {
     pub raw_seen: Instant,
     pub foreign_since: Option<Instant>,
     pub observed_master: [u8; 6],
+    pub confirmed_invalid_rx: Option<u8>,
     master_cand: Option<([u8; 6], u32)>,
     addr_cand: Option<((u8, u8), u32)>,
 }
@@ -432,10 +416,14 @@ impl DeviceHealth {
         ChannelCorrectionAction::Send
     }
 
-    pub(super) fn new(rec: DiscoveredDevice) -> Self {
+    pub(super) fn new(mut rec: DiscoveredDevice) -> Self {
+        if !is_valid_rx(rec.rx_type) {
+            rec.rx_type = 0;
+        }
         Self {
             channel_correction: ChannelCorrection::default(),
             observed_master: rec.master_mac,
+            confirmed_invalid_rx: None,
             published: rec,
             last_seen: Instant::now(),
             bind_intent: false,
@@ -661,6 +649,9 @@ fn merge_sightings(
         h.raw_seen = now;
         h.raw_master = rec.master_mac;
         h.raw_rx = rec.rx_type;
+        if is_valid_rx(rec.rx_type) {
+            h.confirmed_invalid_rx = None;
+        }
         h.raw_channel = rec.channel;
 
         let p = &mut h.published;
@@ -697,20 +688,17 @@ fn merge_sightings(
 
         if let Some((ch, rx)) = commit_streak(&mut h.addr_cand, (rec.channel, rec.rx_type)) {
             h.published.channel = ch;
-            // Only adopt a slot we could have allocated. See is_valid_rx: the
-            // master-clock broadcast leaks cpu_temp into this field, so devices
-            // report slots in the 40-71 range that no allocation produced.
-            // Keeping the previous slot is always better than addressing the
-            // device somewhere it was never bound.
             if is_valid_rx(rx) {
                 h.published.rx_type = rx;
             } else {
-                warn!(
-                    "{} reported out-of-range rx={rx} (valid 1-{}); keeping rx={}",
-                    rec.mac_str(),
-                    RX_SLOT_LIMIT - 1,
-                    h.published.rx_type
-                );
+                if h.confirmed_invalid_rx.is_none() && (rx != 0 || intent) {
+                    warn!(
+                        "{} reported out-of-range rx={rx}; keeping rx={} pending recovery",
+                        rec.mac_str(),
+                        h.published.rx_type
+                    );
+                }
+                h.confirmed_invalid_rx = Some(rx);
             }
         }
 
@@ -804,6 +792,49 @@ fn rebuild_published_vec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_rx_drift_requires_debounce_and_recovers_without_losing_ownership() {
+        for initial_rx in [1, 41] {
+            let controller = super::super::controller::WirelessController::new();
+            let local = [9; 6];
+            let mac = [1; 6];
+            *controller.master_mac.lock() = local;
+            let mut sighting = rec(mac, local);
+            sighting.rx_type = initial_rx;
+            let merge = |sighting: &DiscoveredDevice| {
+                merge_sightings(
+                    std::slice::from_ref(sighting),
+                    &controller.device_health,
+                    &controller.discovered_devices,
+                    &controller.master_mac,
+                );
+            };
+            merge(&sighting);
+            assert!(controller.rebind_candidates().is_empty());
+            assert_eq!(
+                controller.device_by_mac(&mac).unwrap().rx_type,
+                if initial_rx == 1 { 1 } else { 0 }
+            );
+            sighting.rx_type = 41;
+            merge(&sighting);
+            assert!(controller.rebind_candidates().is_empty());
+            merge(&sighting);
+            if initial_rx == 1 {
+                assert!(controller.rebind_candidates().is_empty());
+                merge(&sighting);
+            }
+            assert_eq!(controller.rebind_candidates(), vec![mac]);
+            assert!(controller.unbound_devices().is_empty());
+
+            sighting.rx_type = 2;
+            merge(&sighting);
+            assert!(controller.rebind_candidates().is_empty());
+            merge(&sighting);
+            merge(&sighting);
+            assert_eq!(controller.device_by_mac(&mac).unwrap().rx_type, 2);
+        }
+    }
 
     #[test]
     fn lcd_group_count_uses_each_reported_slot_and_rejects_unknown_data() {

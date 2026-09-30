@@ -1,5 +1,5 @@
 use super::controller::WirelessController;
-use super::discovery::poll_and_discover;
+use super::discovery::{poll_and_discover, DiscoveredDevice, RX_SLOT_LIMIT};
 use super::{
     WirelessFanType, RF_CHUNKS, RF_CHUNK_SIZE, RF_DATA_SIZE, RF_PWM_CMD, RF_SELECT, USB_CMD_SEND_RF,
 };
@@ -8,12 +8,6 @@ use lianli_transport::usb::USB_TIMEOUT;
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::info;
-
-/// Exclusive upper bound for RX slot allocation; slot 0 means unbound.
-/// Valid slots are 1-13, matching `discovery::is_valid_rx`'s definition of
-/// the same range (`rx != 0 && rx < RX_SLOT_LIMIT`), so a device outside it
-/// is a latched sensor value, not a real slot.
-const RX_SLOT_LIMIT: u8 = 14;
 
 impl WirelessController {
     pub fn bind_device(&self, mac: &[u8; 6]) -> Result<()> {
@@ -207,34 +201,17 @@ impl WirelessController {
             .context("device not found in discovery")?;
 
         let master_ch = *self.master_channel.lock();
-        // Byte 16 is the RX slot the device re-binds itself from, so it must
-        // carry the slot we are actually assigning - the same value as byte 14.
-        // Deriving it from the device's position in the discovery list made the
-        // two disagree (observed: "rx=1 ... slot=2"), and converge_bind_state
-        // waits for the device to report `target_rx`, so a bind whose byte 16
-        // says something else can never converge and retries until it times
-        // out. Unbind passes target_rx = 0, which zeroes both fields as before.
-        let slot = target_rx;
+        let slot = if target_rx == 0 {
+            0
+        } else {
+            self.next_slot_index(&device)
+        };
 
-        let mut rf_data = vec![0u8; RF_DATA_SIZE];
-        rf_data[0] = RF_SELECT;
-        rf_data[1] = RF_PWM_CMD;
-        rf_data[2..8].copy_from_slice(&device.mac);
-        rf_data[8..14].copy_from_slice(target_master_mac);
-        rf_data[14] = target_rx;
-        rf_data[15] = master_ch;
-        rf_data[16] = slot;
-        rf_data[17..21].copy_from_slice(&device.current_pwm);
+        let rf_data = build_bind_packet(&device, target_master_mac, target_rx, master_ch, slot);
 
         self.tx_recover(|handle| {
             for _ in 0..6 {
-                // Broadcast rather than addressing the device at its published
-                // slot. Binding is the operation that recovers a device which
-                // has drifted onto a slot we do not know, or whose slot the
-                // discovery guard withheld (published 0) precisely because it
-                // was out of range - in both cases a unicast frame built from
-                // the published slot is delivered nowhere. The destination MAC
-                // in the frame still selects the device.
+                // Recovery cannot rely on the old RX slot. The payload MAC selects the device.
                 self.send_rf_packet_addressed(handle, device.channel, 0xFF, &rf_data)?;
                 thread::sleep(Duration::from_millis(30));
             }
@@ -254,23 +231,7 @@ impl WirelessController {
         Ok(())
     }
 
-    /// Find an unused RX endpoint for a new device binding.
-    ///
-    /// Fails rather than reusing a slot: two devices sharing an RX slot both
-    /// answer to commands aimed at either one. Kept on `device_health`
-    /// (`bind_intent`/`raw_rx`), the current data source for this check, not
-    /// the `discovered_devices`/`master_mac`/`rx_type` shape the original fix
-    /// for this was written against - that shape predates this file's
-    /// device_health-based rewrite upstream.
-    ///
-    /// Checks both `raw_rx` and `published.rx_type`, not `raw_rx` alone. A
-    /// device can have a valid `published.rx_type` that every outgoing frame
-    /// still addresses it at, while its `raw_rx` has drifted to an
-    /// out-of-range value the discovery guard correctly withheld from ever
-    /// reaching `published`. Checking only `raw_rx` would see that device's
-    /// real, still-live slot as free and hand it to a new device, recreating
-    /// the exact two-devices-one-slot collision this function exists to
-    /// prevent.
+    // Reserve both observed and published slots while recovery is pending.
     fn get_rx_unused(&self) -> Result<u8> {
         let health = self.device_health.lock();
         for rx in 1..RX_SLOT_LIMIT {
@@ -315,6 +276,25 @@ impl WirelessController {
             Ok(())
         })
     }
+}
+
+fn build_bind_packet(
+    device: &DiscoveredDevice,
+    master: &[u8; 6],
+    rx: u8,
+    channel: u8,
+    slot: u8,
+) -> Vec<u8> {
+    let mut data = vec![0; RF_DATA_SIZE];
+    data[0] = RF_SELECT;
+    data[1] = RF_PWM_CMD;
+    data[2..8].copy_from_slice(&device.mac);
+    data[8..14].copy_from_slice(master);
+    data[14] = rx;
+    data[15] = channel;
+    data[16] = slot;
+    data[17..21].copy_from_slice(&device.current_pwm);
+    data
 }
 
 struct BindingGuard(std::sync::Arc<parking_lot::Mutex<Option<[u8; 6]>>>);
@@ -375,6 +355,40 @@ mod tests {
     }
 
     #[test]
+    fn bind_packet_preserves_separate_rx_and_sensor_group_index() {
+        let c = controller_with([9; 6], false);
+        let mac = [1, 2, 3, 4, 5, 6];
+        seed_device(&c, &mac, [9; 6], true);
+        let mut device = c.device_health.lock()[&mac].published.clone();
+        device.current_pwm = [100, 150, 200, 0];
+        let data = build_bind_packet(&device, &[9; 6], 7, 8, 2);
+        assert_eq!(
+            &data[..21],
+            &[0x12, 0x10, 1, 2, 3, 4, 5, 6, 9, 9, 9, 9, 9, 9, 7, 8, 2, 100, 150, 200, 0]
+        );
+        assert_eq!(data.len(), RF_DATA_SIZE);
+        assert!(data[21..].iter().all(|byte| *byte == 0));
+        let unbind = build_bind_packet(&device, &[0; 6], 0, 8, 0);
+        assert_eq!(&unbind[8..17], &[0, 0, 0, 0, 0, 0, 0, 8, 0]);
+    }
+
+    #[test]
+    fn rx_allocation_fails_when_every_slot_is_reserved() {
+        let c = controller_with([9; 6], false);
+        for rx in 1..RX_SLOT_LIMIT {
+            let mac = [rx; 6];
+            seed_device(&c, &mac, [9; 6], true);
+            c.device_health
+                .lock()
+                .get_mut(&mac)
+                .unwrap()
+                .published
+                .rx_type = rx;
+        }
+        assert!(c.get_rx_unused().is_err());
+    }
+
+    #[test]
     fn pending_binding_is_exclusive_and_released_on_failure() {
         let c = controller_with([9; 6], false);
         let mac = [1, 2, 3, 4, 5, 6];
@@ -390,12 +404,6 @@ mod tests {
     fn get_rx_unused_skips_a_slot_still_live_via_published_rx_type() {
         let c = controller_with([9u8; 6], false);
         seed_device(&c, &[1, 2, 3, 4, 5, 6], [9u8; 6], true);
-        // seed_device leaves raw_rx at DeviceHealth::new's default (0) while
-        // published.rx_type is 1 - the shape of a device whose raw report
-        // has drifted to an out-of-range value the discovery guard withheld
-        // from published, while every outgoing frame still addresses it at
-        // its real, live slot, 1. Checking raw_rx alone would see slot 1 as
-        // free and hand it to a new device.
         assert_eq!(
             c.get_rx_unused().unwrap(),
             2,
@@ -416,6 +424,7 @@ mod tests {
         drop(health);
         c.confirm_binding(&mac, false);
         assert!(c.devices().is_empty());
+        assert_eq!(c.discovered_devices.lock()[0].rx_type, 0);
         assert_eq!(c.unbound_devices().len(), 1);
         assert!(c.rebind_candidates().is_empty());
     }
