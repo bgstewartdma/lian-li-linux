@@ -274,9 +274,9 @@ impl WirelessController {
     fn get_rx_unused(&self) -> Result<u8> {
         let health = self.device_health.lock();
         for rx in 1..RX_SLOT_LIMIT {
-            let in_use = health.values().any(|h| {
-                h.bind_intent && !h.dead && (h.raw_rx == rx || h.published.rx_type == rx)
-            });
+            let in_use = health
+                .values()
+                .any(|h| h.bind_intent && !h.dead && (h.raw_rx == rx || h.published.rx_type == rx));
             if !in_use {
                 return Ok(rx);
             }

@@ -12,7 +12,7 @@ use super::{
 use anyhow::{bail, Context, Result};
 use lianli_transport::usb::{RusbBulk, USB_TIMEOUT};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1024,7 +1024,9 @@ mod tests {
         let mut owner = WirelessController::new();
         owner.runtime_claim = Some(RuntimeClaim::acquire(&owner.runtime_claimed).unwrap());
         owner.poll_stop.store(true, Ordering::Release);
-        owner.clock_init_count.store(CLOCK_INIT_FRAMES, Ordering::Release);
+        owner
+            .clock_init_count
+            .store(CLOCK_INIT_FRAMES, Ordering::Release);
         let mut clone = owner.clone();
 
         assert!(clone

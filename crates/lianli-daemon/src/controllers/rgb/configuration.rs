@@ -527,8 +527,7 @@ mod tests {
     fn direct_zone_uses_configured_colors_on_fresh_start() {
         let (sender, received) = mpsc::channel();
         let device = Arc::new(LoopDevice(sender)) as Arc<dyn RgbDevice>;
-        let mut controller =
-            RgbController::new(HashMap::from([("live".into(), device)]), None);
+        let mut controller = RgbController::new(HashMap::from([("live".into(), device)]), None);
 
         let mut saved = saved_device("live");
         saved.zones = vec![RgbZoneConfig {
@@ -642,7 +641,9 @@ mod tests {
         controller.apply_config(&config, &[]);
 
         // Push an unrelated live frame directly.
-        controller.set_direct_colors("live", 0, &[[1, 2, 3]]).unwrap();
+        controller
+            .set_direct_colors("live", 0, &[[1, 2, 3]])
+            .unwrap();
         assert_eq!(
             received.recv_timeout(Duration::from_secs(1)).unwrap(),
             vec![vec![[1, 2, 3]]]
