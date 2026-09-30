@@ -529,11 +529,17 @@ impl ServiceManager {
         // `000000000000` on 2026-09-22 - previously required a manual
         // BindWirelessDevice forever, identical in kind to the slot-recovery
         // gap `rebind_slotless_devices()` closes for a bad-but-bound rx.
-        let mut candidates = self
-            .wireless
-            .rebind_candidates()
-            .into_iter()
-            .chain(self.wireless.unbound_devices().into_iter().map(|d| d.mac));
+        let mut candidates = self.wireless.rebind_candidates().into_iter().chain(
+            self.wireless
+                .unbound_devices()
+                .into_iter()
+                .map(|d| d.mac)
+                // unbound_devices() does not check man_unbind - a manual
+                // "bind all" is meant to reach a device the user detached on
+                // purpose, but automatic recovery must not silently override
+                // that choice.
+                .filter(|mac| !self.wireless.is_manually_unbound(mac)),
+        );
 
         let Some(mac) = candidates.find(|m| {
             let id = format!(

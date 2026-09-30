@@ -653,6 +653,17 @@ impl WirelessController {
             })
     }
 
+    /// Whether the user explicitly unbound this device and it has not been
+    /// bound again since. `unbound_devices()` does not check this - a manual
+    /// "bind all" is meant to override it - but automatic recovery must not,
+    /// or it silently rebinds a device the user deliberately left detached.
+    pub fn is_manually_unbound(&self, mac: &[u8; 6]) -> bool {
+        self.device_health
+            .lock()
+            .get(mac)
+            .is_some_and(|h| h.man_unbind)
+    }
+
     /// Snapshot of devices available for binding (observed foreign, no intent).
     pub fn unbound_devices(&self) -> Vec<DiscoveredDevice> {
         let local_mac = *self.master_mac.lock();
@@ -1361,6 +1372,16 @@ mod tests {
             ([4, 2, 3, 4, 5, 6], healthy),
         ]);
         assert!(c.rebind_candidates().is_empty());
+    }
+
+    #[test]
+    fn is_manually_unbound_reads_man_unbind() {
+        let mut unbound = entry([0u8; 6]);
+        unbound.man_unbind = true;
+        let c = controller_with_health(vec![(mac(), unbound), ([9u8; 6], entry([0u8; 6]))]);
+        assert!(c.is_manually_unbound(&mac()));
+        assert!(!c.is_manually_unbound(&[9u8; 6]));
+        assert!(!c.is_manually_unbound(&[8, 8, 8, 8, 8, 8]));
     }
 
     #[test]
