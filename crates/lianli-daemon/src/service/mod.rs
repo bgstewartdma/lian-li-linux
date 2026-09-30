@@ -429,6 +429,12 @@ impl ServiceManager {
         let wireless_devices = self.wireless.devices();
         let current_wireless = wireless_devices.len();
         if current_wireless != self.wireless_stable_count {
+            // A device-count change is a different kind of event than a
+            // topology mismatch on a stable count; let it interrupt a
+            // topology-mismatch streak in progress rather than leave stale
+            // progress that a later, unrelated topology mismatch could
+            // complete after too few genuinely consecutive polls.
+            self.wireless_topology_mismatch_streak = 0;
             match self.wireless_pending_count {
                 Some(c) if c == current_wireless => self.wireless_pending_streak += 1,
                 _ => {
@@ -455,6 +461,7 @@ impl ServiceManager {
         } else if self.wireless_pending_count.is_some() {
             self.wireless_pending_count = None;
             self.wireless_pending_streak = 0;
+            self.wireless_topology_mismatch_streak = 0;
         } else if self
             .controllers
             .rgb
